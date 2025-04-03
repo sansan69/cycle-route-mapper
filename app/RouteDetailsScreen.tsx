@@ -1,12 +1,13 @@
-import { View, StyleSheet, TouchableOpacity, Text, TextInput, Alert } from 'react-native';
+import React, { useEffect, useRef, useState } from 'react';
+import { View, StyleSheet, TouchableOpacity, Text, TextInput, Alert, Button } from 'react-native';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import MapView, { Polyline, Marker, PROVIDER_GOOGLE } from 'react-native-maps';
-import { Heart, ArrowLeft, Star, Tag, Bookmark } from 'lucide-react-native';
+import { Heart, ArrowLeft, Star, Tag, Bookmark, Navigation, StopCircle } from 'lucide-react-native';
 import Toast from 'react-native-toast-message';
-import { saveRoute } from '@/utils/storage';
-import { useState, useEffect } from 'react';
-import { getSavedRoutes } from '@/utils/storage';
+import { saveRoute, getSavedRoutes } from '@/utils/storage';
 import { v4 as uuidv4 } from 'uuid';
+import * as Location from 'expo-location';
+import * as MediaLibrary from 'expo-media-library';
 
 interface Location {
   latitude: number;
@@ -22,10 +23,27 @@ interface Route {
   coordinates: [number, number][];
   rating?: number;
   tags?: string[];
-  createdAt?: Date;
+  createdAt?: string;
 }
 
 const AVAILABLE_TAGS = ['Scenic', 'Offbeat', 'City Loop', 'Village Trail'];
+const ROUTE_DEVIATION_THRESHOLD = 0.5; // 500 meters in kilometers
+
+const requestStoragePermission = async () => {
+  const { status } = await MediaLibrary.requestPermissionsAsync();
+  if (status !== 'granted') {
+    Toast.show({ type: 'error', text1: 'Storage permission denied' });
+    return false;
+  }
+  return true;
+};
+
+const onSaveRoute = async (routeData: Route) => {
+  const hasPermission = await requestStoragePermission();
+  if (!hasPermission) return;
+  await saveRoute(routeData);
+  Toast.show({ type: 'success', text1: 'Route saved locally' });
+};
 
 export default function RouteDetailsScreen() {
   const router = useRouter();
@@ -35,8 +53,14 @@ export default function RouteDetailsScreen() {
   const [selectedTags, setSelectedTags] = useState<string[]>([]);
   const [liked, setLiked] = useState(false);
   const [savedRoutes, setSavedRoutes] = useState<Route[]>([]);
+  const [userLocation, setUserLocation] = useState<Location | null>(null);
+  const [watcher, setWatcher] = useState<Location.LocationSubscription | null>(null);
+  const mapRef = useRef<MapView>(null);
 
   const handleBack = () => {
+    if (watcher) {
+      watcher.remove();
+    }
     router.back();
   };
 
@@ -70,12 +94,7 @@ export default function RouteDetailsScreen() {
         tags: selectedTags,
         createdAt: new Date().toISOString(),
       };
-      await saveRoute(routeToSave);
-      Toast.show({
-        type: 'success',
-        text1: 'Success',
-        text2: 'Route saved to your Saved Routes',
-      });
+      await onSaveRoute(routeToSave);
     } catch (error) {
       Toast.show({
         type: 'error',
@@ -95,6 +114,11 @@ export default function RouteDetailsScreen() {
 
   useEffect(() => {
     loadSavedRoutes();
+    return () => {
+      if (watcher) {
+        watcher.remove();
+      }
+    };
   }, []);
 
   const loadSavedRoutes = async () => {
@@ -128,27 +152,38 @@ export default function RouteDetailsScreen() {
       </TouchableOpacity>
       
       <MapView
+        ref={mapRef}
         provider={PROVIDER_GOOGLE}
         style={styles.map}
+        showsUserLocation
+        followsUserLocation={watcher !== null}
+        showsMyLocationButton
+        scrollEnabled={!watcher}
+        zoomEnabled={!watcher}
         initialRegion={{
           latitude: routeData.startLocation.latitude,
           longitude: routeData.startLocation.longitude,
-          latitudeDelta: 0.0922,
-          longitudeDelta: 0.0421,
+          latitudeDelta: 0.05,
+          longitudeDelta: 0.05,
         }}
-        showsUserLocation
-        showsMyLocationButton
       >
         <Polyline
           coordinates={routeData.coordinates.map(coord => ({
             latitude: coord[0],
             longitude: coord[1],
           }))}
-          strokeColor="#2563eb"
-          strokeWidth={3}
+          strokeColor="#1E90FF"
+          strokeWidth={4}
         />
         <Marker coordinate={routeData.startLocation} />
         <Marker coordinate={routeData.endLocation} />
+        {userLocation && (
+          <Marker
+            coordinate={userLocation}
+            title="You"
+            pinColor="blue"
+          />
+        )}
       </MapView>
 
       <View style={styles.infoContainer}>
@@ -203,11 +238,68 @@ export default function RouteDetailsScreen() {
             </Text>
           </TouchableOpacity>
 
-          <TouchableOpacity style={styles.button} onPress={handleSaveRoute}>
-            <Bookmark color="#2563eb" size={24} />
-            <Text style={styles.buttonText}>Save Route</Text>
-          </TouchableOpacity>
+          <Button 
+            title="Save Route" 
+            onPress={handleSaveRoute}
+            color="#2563eb"
+          />
         </View>
+
+        <TouchableOpacity
+          style={[styles.navigationButton, watcher && styles.navigationButtonActive]}
+          onPress={async () => {
+            if (!watcher) {
+              const { status } = await Location.requestForegroundPermissionsAsync();
+              if (status !== 'granted') {
+                Toast.show({ 
+                  type: 'error', 
+                  text1: 'Location permission denied',
+                  text2: 'Please enable location access in your device settings'
+                });
+                return;
+              }
+
+              const subscription = await Location.watchPositionAsync(
+                { 
+                  accuracy: Location.Accuracy.High, 
+                  timeInterval: 2000, 
+                  distanceInterval: 10 
+                },
+                (location) => {
+                  const coords = {
+                    latitude: location.coords.latitude,
+                    longitude: location.coords.longitude,
+                  };
+                  setUserLocation(coords);
+                  mapRef.current?.animateToRegion({
+                    ...coords,
+                    latitudeDelta: 0.01,
+                    longitudeDelta: 0.01,
+                  }, 1000);
+                }
+              );
+
+              setWatcher(subscription);
+              Toast.show({ 
+                type: 'success', 
+                text1: 'Navigation started',
+                text2: 'Following your location'
+              });
+            } else {
+              watcher.remove();
+              setWatcher(null);
+              Toast.show({ 
+                type: 'info', 
+                text1: 'Navigation stopped',
+                text2: 'Map controls restored'
+              });
+            }
+          }}
+        >
+          <Text style={styles.navigationButtonText}>
+            {watcher ? 'Stop Navigation' : 'Start Navigation'}
+          </Text>
+        </TouchableOpacity>
       </View>
     </View>
   );
@@ -330,5 +422,25 @@ const styles = StyleSheet.create({
     color: '#ef4444',
     textAlign: 'center',
     marginTop: 20,
+  },
+  navigationButton: {
+    backgroundColor: '#2563eb',
+    padding: 16,
+    borderRadius: 12,
+    alignItems: 'center',
+    marginTop: 16,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.1,
+    shadowRadius: 4,
+    elevation: 3,
+  },
+  navigationButtonActive: {
+    backgroundColor: '#ef4444',
+  },
+  navigationButtonText: {
+    color: '#ffffff',
+    fontSize: 16,
+    fontWeight: '600',
   },
 }); 
