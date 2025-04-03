@@ -79,7 +79,7 @@ export default function SavedScreen() {
       <FlatList
         data={savedRoutes}
         renderItem={renderRouteItem}
-        keyExtractor={(item) => item.id || `${item.name}-${item.distance}`}
+        keyExtractor={(item) => item.id}
         contentContainerStyle={styles.listContent}
       />
     </View>

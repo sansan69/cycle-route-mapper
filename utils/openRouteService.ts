@@ -1,53 +1,78 @@
 import * as polyline from '@mapbox/polyline';
+import { v4 as uuid } from 'uuid';
 
-const GOOGLE_API_KEY = 'AIzaSyDoCRiWM2oL2ka68KFtrUCw-RqIcDXU6zs';
+const GOOGLE_API_KEY = 'AIzaSyDoCRiWM2oL2ka68KFtrUCw-RqIcDXU6zs'; // API key updated
 
 interface Location {
   latitude: number;
   longitude: number;
 }
 
-interface Route {
-  id: string;
-  name: string;
-  distance: number;
-  startLocation: Location;
-  endLocation: Location;
-  coordinates: [number, number][];
+// Interface for a single step in Google Directions
+interface GoogleDirectionsStep {
+  html_instructions: string;
+  distance: { value: number; text: string };
+  duration: { value: number; text: string };
+  start_location: { lat: number; lng: number };
+  end_location: { lat: number; lng: number };
+  polyline: { points: string };
+  maneuver?: string; // e.g., "turn-left", "merge", "roundabout-exit"
 }
 
+// Interface for a leg of the route (between waypoints)
 interface GoogleDirectionsLeg {
-  distance: {
-    value: number;
-  };
-  start_location: {
-    lat: number;
-    lng: number;
-  };
-  end_location: {
-    lat: number;
-    lng: number;
-  };
-  polyline: {
-    points: string;
-  };
+  distance: { value: number; text: string };
+  duration: { value: number; text: string };
+  start_location: { lat: number; lng: number };
+  end_location: { lat: number; lng: number };
+  start_address: string;
+  end_address: string;
+  steps: GoogleDirectionsStep[];
 }
 
+// Interface for the overall route from Google Directions
 interface GoogleDirectionsRoute {
-  overview_polyline: {
-    points: string;
-  };
+  summary: string; // e.g., "US-101 N"
+  overview_polyline: { points: string };
   legs: GoogleDirectionsLeg[];
+  copyrights: string;
+  warnings: string[];
+  waypoint_order: number[];
+  bounds: {
+    northeast: { lat: number; lng: number };
+    southwest: { lat: number; lng: number };
+  };
 }
 
+// Interface for the API response
 interface GoogleDirectionsResponse {
   status: string;
   routes: GoogleDirectionsRoute[];
+  geocoded_waypoints?: { geocoder_status: string; place_id: string; types: string[] }[];
 }
 
+// Interface for a segment, potentially used by helper functions
 interface RouteSegment {
   start: [number, number];
   end: [number, number];
+}
+
+// Our application's Route interface, now including steps
+interface Route {
+  id: string;
+  name: string;
+  description: string;
+  distance: number;
+  duration: number;
+  points: string;
+  startLocation: Location;
+  waypoints: Location[];
+  steps: GoogleDirectionsStep[];
+  bounds: {
+    northeast: { latitude: number; longitude: number };
+    southwest: { latitude: number; longitude: number };
+  };
+  createdAt: string;
 }
 
 /**
@@ -146,151 +171,246 @@ function hasPathOverlap(path1: [number, number][], path2: [number, number][]): b
   return (overlapCount / totalSegments) > 0.4; // More than 40% overlap
 }
 
-function generateRandomWaypoints(startLocation: Location, radius: number): Location[] {
-  const numWaypoints = Math.floor(Math.random() * 5) + 8; // 8-12 waypoints
+function generateRandomPoint(center: Location, radiusInKm: number): Location {
+    const earthRadiusKm = 6371;
+    const lat1Rad = center.latitude * (Math.PI / 180);
+    const lon1Rad = center.longitude * (Math.PI / 180);
+    
+    // Bias distance towards outer 70% of the radius
+    const minFraction = 0.3; // Start from 30% of the radius outward
+    const randomFraction = minFraction + Math.random() * (1 - minFraction); // Random value between minFraction and 1.0
+    const angularDistance = (radiusInKm / earthRadiusKm) * randomFraction;
+    
+    const bearing = Math.random() * 2 * Math.PI; // Random angle
+
+    const lat2Rad = Math.asin(Math.sin(lat1Rad) * Math.cos(angularDistance) +
+                           Math.cos(lat1Rad) * Math.sin(angularDistance) * Math.cos(bearing));
+    const lon2Rad = lon1Rad + Math.atan2(Math.sin(bearing) * Math.sin(angularDistance) * Math.cos(lat1Rad),
+                                  Math.cos(angularDistance) - Math.sin(lat1Rad) * Math.sin(lat2Rad));
+
+    return {
+      latitude: lat2Rad * (180 / Math.PI),
+      longitude: lon2Rad * (180 / Math.PI),
+    };
+}
+
+function generateRandomWaypoints(startLocation: Location, radius: number, numWaypoints: number): Location[] {
   const waypoints: Location[] = [];
   const usedPoints = new Set<string>();
+  const minWaypointDistanceKm = radius * 0.1; // Ensure waypoints aren't too close
 
-  // Generate unique waypoints with more spread
-  while (waypoints.length < numWaypoints) {
+  let waypointAttempts = 0;
+  const maxWaypointAttempts = numWaypoints * 5; // Limit attempts to avoid infinite loops
+
+  while (waypoints.length < numWaypoints && waypointAttempts < maxWaypointAttempts) {
+    waypointAttempts++;
     const point = generateRandomPoint(startLocation, radius);
-    const pointKey = `${point.latitude},${point.longitude}`;
-    
-    if (!usedPoints.has(pointKey)) {
+    const pointKey = `${point.latitude.toFixed(5)},${point.longitude.toFixed(5)}`;
+
+    // Check if too close to existing waypoints or start location
+    let tooClose = false;
+    const pointsToCheck = [startLocation, ...waypoints];
+    for (const existingPoint of pointsToCheck) {
+        if (calculateDistance(point.latitude, point.longitude, existingPoint.latitude, existingPoint.longitude) < minWaypointDistanceKm) {
+            tooClose = true;
+            break;
+        }
+    }
+
+    if (!usedPoints.has(pointKey) && !tooClose) {
       waypoints.push(point);
       usedPoints.add(pointKey);
     }
   }
 
-  // Sort waypoints by angle from center for circular layout
+  // Sort waypoints by angle for a more circular path suggestion to the API
   waypoints.sort((a, b) => {
     const angleA = calculateAngle(startLocation, a);
     const angleB = calculateAngle(startLocation, b);
     return angleA - angleB;
   });
 
+  console.log(`Generated ${waypoints.length} waypoints after ${waypointAttempts} attempts.`);
   return waypoints;
 }
 
+function calculateRouteOverlap(polyline1: string, polyline2: string): number {
+  const points1 = polyline.decode(polyline1);
+  const points2 = polyline.decode(polyline2);
+  
+  // Calculate the total length of both routes
+  const length1 = calculatePolylineLength(points1);
+  const length2 = calculatePolylineLength(points2);
+  
+  // Calculate the overlapping segments
+  let overlapLength = 0;
+  const threshold = 0.0001; // Approximately 11 meters
+  
+  for (let i = 0; i < points1.length - 1; i++) {
+    const segment1Start = points1[i];
+    const segment1End = points1[i + 1];
+    
+    for (let j = 0; j < points2.length - 1; j++) {
+      const segment2Start = points2[j];
+      const segment2End = points2[j + 1];
+      
+      // Check if segments are close enough to be considered overlapping
+      if (
+        Math.abs(segment1Start[0] - segment2Start[0]) < threshold &&
+        Math.abs(segment1Start[1] - segment2Start[1]) < threshold &&
+        Math.abs(segment1End[0] - segment2End[0]) < threshold &&
+        Math.abs(segment1End[1] - segment2End[1]) < threshold
+      ) {
+        overlapLength += calculateSegmentLength(segment1Start, segment1End);
+        break;
+      }
+    }
+  }
+  
+  // Return the overlap ratio (0 to 1)
+  return overlapLength / Math.max(length1, length2);
+}
+
+function calculatePolylineLength(points: [number, number][]): number {
+  let length = 0;
+  for (let i = 0; i < points.length - 1; i++) {
+    length += calculateSegmentLength(points[i], points[i + 1]);
+  }
+  return length;
+}
+
+function calculateSegmentLength(start: [number, number], end: [number, number]): number {
+  const R = 6371; // Earth's radius in kilometers
+  const lat1 = start[0] * Math.PI / 180;
+  const lat2 = end[0] * Math.PI / 180;
+  const dLat = (end[0] - start[0]) * Math.PI / 180;
+  const dLon = (end[1] - start[1]) * Math.PI / 180;
+  
+  const a = Math.sin(dLat/2) * Math.sin(dLat/2) +
+           Math.cos(lat1) * Math.cos(lat2) *
+           Math.sin(dLon/2) * Math.sin(dLon/2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+  return R * c;
+}
+
 /**
- * Generates cycling routes using Google Maps Directions API
- * @param startLocation Starting point coordinates
- * @param radius Radius in kilometers
- * @returns Array of generated routes
+ * Generates cycling routes using Google Maps Directions API.
  */
 export async function generateRoutes(
   startLocation: Location,
-  radius: number,
-  maxRoutes: number = 20
+  radiusKm: number = 10,
+  numRoutes: number = 10,
+  minDistanceKm: number = 10,
+  maxDistanceKm: number = 50
 ): Promise<Route[]> {
+  console.log(`Generating ${numRoutes} routes within ${radiusKm}km radius...`);
+  console.log(`Target distance range: ${minDistanceKm}-${maxDistanceKm}km`);
+
   const routes: Route[] = [];
-  const maxAttempts = 50;
   let attempts = 0;
-  const uniqueRoutes = new Set<string>();
+  const maxAttempts = 100; // Increased from 50 to 100
 
-  while (routes.length < maxRoutes && attempts < maxAttempts) {
+  while (routes.length < numRoutes && attempts < maxAttempts) {
     attempts++;
-    const waypoints = generateRandomWaypoints(startLocation, radius);
-    const waypointsString = waypoints
-      .map((wp: Location) => `via:${wp.latitude},${wp.longitude}`)
-      .join('|');
-
-    const url = `https://maps.googleapis.com/maps/api/directions/json?origin=${startLocation.latitude},${startLocation.longitude}&destination=${startLocation.latitude},${startLocation.longitude}&waypoints=${waypointsString}&mode=driving&key=${GOOGLE_API_KEY}&avoid=tolls|ferries|highways`;
+    console.log(`\nAttempt ${attempts}/${maxAttempts}`);
 
     try {
-      const response = await fetch(url);
-      const data: GoogleDirectionsResponse = await response.json();
+      // Generate waypoints with improved separation
+      const waypoints = generateRandomWaypoints(startLocation, radiusKm, 3);
+      console.log('Generated waypoints:', waypoints);
 
-      // Check API response status and routes
-      if (data.status !== 'OK' || !data.routes || data.routes.length === 0) {
-        console.warn('Invalid response from Google Maps API:', data.status);
-        continue;
-      }
-
-      // Check polyline data
-      if (
-        !data.routes[0] ||
-        !data.routes[0].overview_polyline ||
-        !data.routes[0].overview_polyline.points
-      ) {
-        console.warn('No valid polyline returned by Google Maps. Skipping route.');
-        continue;
-      }
-
-      const decodedPath = polyline.decode(data.routes[0].overview_polyline.points);
-      const totalDistance = data.routes[0].legs.reduce(
-        (sum, leg) => sum + leg.distance.value,
-        0
-      ) / 1000; // Convert to km
-
-      if (totalDistance < 10) {
-        console.warn('Route too short:', totalDistance, 'km');
-        continue;
-      }
-
-      // Create a unique hash for the route coordinates
-      const routeHash = decodedPath
-        .map(coord => `${coord[0].toFixed(6)},${coord[1].toFixed(6)}`)
+      // Build the URL with proper parameters
+      const waypointsParam = waypoints
+        .map(wp => `${wp.latitude},${wp.longitude}`)
         .join('|');
 
-      if (uniqueRoutes.has(routeHash)) {
-        console.warn('Duplicate route detected, skipping');
+      const url = `https://maps.googleapis.com/maps/api/directions/json?origin=${
+        startLocation.latitude
+      },${startLocation.longitude}&destination=${
+        startLocation.latitude
+      },${startLocation.longitude}&waypoints=optimize:true|${waypointsParam}&mode=driving&avoid=highways&key=${GOOGLE_API_KEY}`;
+
+      console.log('Requesting route from Google Directions API...');
+      const response = await fetch(url);
+      const data = await response.json();
+
+      if (data.status !== 'OK') {
+        console.log(`Route rejected: API returned status "${data.status}"`);
         continue;
       }
 
-      const route: Route = {
-        id: `route-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
-        name: `Route ${routes.length + 1}`,
-        distance: totalDistance,
-        startLocation,
-        endLocation: startLocation,
-        coordinates: decodedPath,
-      };
+      const route = data.routes[0];
+      const distanceInMeters = route.legs.reduce(
+        (total: number, leg: any) => total + leg.distance.value,
+        0
+      );
+      const distanceInKm = distanceInMeters / 1000;
 
-      // Check for path overlap with existing routes
-      const hasOverlap = routes.some(existingRoute => 
-        hasPathOverlap(decodedPath, existingRoute.coordinates)
+      console.log(`Route distance: ${distanceInKm.toFixed(2)}km`);
+
+      // Check if route meets distance criteria
+      if (distanceInKm < minDistanceKm || distanceInKm > maxDistanceKm) {
+        console.log(
+          `Route rejected: Distance ${distanceInKm.toFixed(2)}km outside target range ${minDistanceKm}-${maxDistanceKm}km`
+        );
+        continue;
+      }
+
+      // Check for route overlap (if we have any routes)
+      if (routes.length > 0) {
+        const isOverlapping = routes.some(existingRoute => {
+          const overlap = calculateRouteOverlap(
+            existingRoute.points,
+            route.overview_polyline.points
+          );
+          return overlap > 0.7; // 70% overlap threshold
+        });
+
+        if (isOverlapping) {
+          console.log('Route rejected: Too similar to existing routes');
+          continue;
+        }
+      }
+
+      // Extract steps and format them
+      const steps = route.legs.flatMap((leg: any) =>
+        leg.steps.map((step: any) => ({
+          instruction: step.html_instructions.replace(/<[^>]*>/g, ''),
+          distance: step.distance.text,
+          duration: step.duration.text,
+          maneuver: step.maneuver || 'straight',
+          location: {
+            latitude: step.start_location.lat,
+            longitude: step.start_location.lng,
+          },
+        }))
       );
 
-      if (hasOverlap) {
-        console.warn('Route has too much overlap with existing routes');
-        continue;
-      }
+      // Create route object with all required fields
+      const newRoute: Route = {
+        id: uuid(),
+        name: `Route ${routes.length + 1}`,
+        description: `A ${distanceInKm.toFixed(1)}km cycling route`,
+        distance: distanceInKm,
+        duration: route.legs.reduce(
+          (total: number, leg: any) => total + leg.duration.value,
+          0
+        ),
+        points: route.overview_polyline.points,
+        startLocation,
+        waypoints,
+        steps,
+        bounds: route.bounds,
+        createdAt: new Date().toISOString(),
+      };
 
-      uniqueRoutes.add(routeHash);
-      routes.push(route);
+      routes.push(newRoute);
+      console.log(`Route ${routes.length} accepted!`);
     } catch (error) {
       console.error('Error generating route:', error);
     }
   }
 
+  console.log(`\nGenerated ${routes.length} routes after ${attempts} attempts`);
   return routes;
-}
-
-/**
- * Generates a random point within a given radius
- * @param center Center point coordinates
- * @param radiusInKm Radius in kilometers
- * @returns Random point coordinates within the radius
- */
-function generateRandomPoint(center: Location, radiusInKm: number): Location {
-  const adjustedRadius = radiusInKm * 0.3;
-  const radiusInDeg = adjustedRadius / 111.32;
-
-  const u = Math.random();
-  const v = Math.random();
-
-  const w = radiusInDeg * Math.sqrt(u);
-  const t = 2 * Math.PI * v;
-
-  const x = w * Math.cos(t);
-  const y = w * Math.sin(t);
-
-  const newLat = Math.max(-90, Math.min(90, center.latitude + y));
-  const newLng = Math.max(-180, Math.min(180, center.longitude + x / Math.cos(center.latitude * Math.PI / 180)));
-
-  return {
-    latitude: newLat,
-    longitude: newLng,
-  };
 }

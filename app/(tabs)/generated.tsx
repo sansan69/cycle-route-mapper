@@ -26,7 +26,7 @@ export default function GeneratedScreen() {
       <FlatList
         data={routes}
         renderItem={({ item }) => <RouteItem route={item} />}
-        keyExtractor={(item) => item.id || `${item.name}-${item.distance}`}
+        keyExtractor={(item, index) => `generated-${index}`}
         contentContainerStyle={styles.listContent}
       />
     </View>

@@ -35,12 +35,6 @@ export default function TabLayout() {
           tabBarIcon: ({ color }) => <Bookmark color={color} size={24} />,
         }}
       />
-      <Tabs.Screen
-        name="RouteDetailsScreen"
-        options={{
-          href: null,
-        }}
-      />
     </Tabs>
   );
 }

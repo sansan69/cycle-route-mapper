@@ -1,8 +1,8 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { View, StyleSheet, TouchableOpacity, Text, TextInput, ScrollView } from 'react-native';
+import { View, StyleSheet, TouchableOpacity, Text, TextInput, ScrollView, Alert } from 'react-native';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import MapView, { Polyline, Marker, PROVIDER_GOOGLE } from 'react-native-maps';
-import { Heart, ArrowLeft, Star, Tag, Bookmark, Navigation } from 'lucide-react-native';
+import { Heart, ArrowLeft, Star, Tag, Bookmark, Navigation, MapPin, PlayCircle } from 'lucide-react-native';
 import Toast from 'react-native-toast-message';
 import { saveRoute, getSavedRoutes } from '@/utils/storage';
 import { v4 as uuidv4 } from 'uuid';
@@ -14,13 +14,29 @@ interface Location {
   longitude: number;
 }
 
+interface GoogleDirectionsStep {
+  html_instructions: string;
+  distance: { value: number; text: string };
+  duration: { value: number; text: string };
+  start_location: { lat: number; lng: number };
+  end_location: { lat: number; lng: number };
+  polyline: { points: string };
+  maneuver?: string;
+}
+
 interface Route {
   id: string;
   name: string;
   distance: number;
+  duration?: number;
   startLocation: Location;
   endLocation: Location;
   coordinates: [number, number][];
+  steps?: GoogleDirectionsStep[];
+  bounds?: {
+    northeast: Location;
+    southwest: Location;
+  };
   rating?: number;
   tags?: string[];
   createdAt?: string;
@@ -38,29 +54,47 @@ const requestStoragePermission = async () => {
   return true;
 };
 
-const onSaveRoute = async (routeData: Route) => {
+const onSaveRoute = async (routeToSave: Route) => {
   const hasPermission = await requestStoragePermission();
   if (!hasPermission) return;
-  await saveRoute(routeData);
-  Toast.show({ type: 'success', text1: 'Route saved locally' });
+  await saveRoute(routeToSave);
+  Toast.show({ type: 'success', text1: 'Route saved locally!' });
 };
 
 export default function RouteDetailsScreen() {
   const router = useRouter();
   const { route: routeParam } = useLocalSearchParams();
-  const routeData: Route = routeParam ? JSON.parse(routeParam as string) : null;
+  const [routeData, setRouteData] = useState<Route | null>(null);
   const [rating, setRating] = useState<string>('');
   const [selectedTags, setSelectedTags] = useState<string[]>([]);
   const [liked, setLiked] = useState(false);
-  const [savedRoutes, setSavedRoutes] = useState<Route[]>([]);
   const [userLocation, setUserLocation] = useState<Location | null>(null);
-  const [watcher, setWatcher] = useState<Location.LocationSubscription | null>(null);
+  const [locationWatcher, setLocationWatcher] = useState<Location.LocationSubscription | null>(null);
   const mapRef = useRef<MapView>(null);
 
-  const handleBack = () => {
-    if (watcher) {
-      watcher.remove();
+  useEffect(() => {
+    if (routeParam) {
+      try {
+        const parsedRoute: Route = JSON.parse(routeParam as string);
+        setRouteData(parsedRoute);
+        if (parsedRoute.rating) setRating(String(parsedRoute.rating));
+        if (parsedRoute.tags) setSelectedTags(parsedRoute.tags);
+      } catch (e) {
+        console.error("Failed to parse route data from params", e);
+        Toast.show({ type: 'error', text1: 'Error loading route details' });
+      }
     }
+  }, [routeParam]);
+
+  useEffect(() => {
+    return () => {
+      if (locationWatcher) {
+        locationWatcher.remove();
+      }
+    };
+  }, [locationWatcher]);
+
+  const handleBack = () => {
     router.back();
   };
 
@@ -78,205 +112,199 @@ export default function RouteDetailsScreen() {
 
     const ratingNum = parseFloat(rating);
     if (isNaN(ratingNum) || ratingNum < 1 || ratingNum > 5) {
-      Toast.show({
-        type: 'error',
-        text1: 'Error',
-        text2: 'Please enter a valid rating between 1 and 5',
-      });
+      Toast.show({ type: 'error', text1: 'Invalid Rating', text2: 'Please enter a rating between 1 and 5' });
       return;
     }
 
     try {
-      const routeToSave = {
+      const idToUse = routeData.id.startsWith('route-') ? uuidv4() : routeData.id;
+
+      const routeToSave: Route = {
         ...routeData,
-        id: uuidv4(),
+        id: idToUse,
         rating: ratingNum,
         tags: selectedTags,
-        createdAt: new Date().toISOString(),
+        createdAt: routeData.createdAt || new Date().toISOString(),
+        steps: routeData.steps,
+        duration: routeData.duration,
+        bounds: routeData.bounds,
       };
       await onSaveRoute(routeToSave);
+      if(idToUse !== routeData.id) {
+          setRouteData(prev => prev ? { ...prev, id: idToUse, createdAt: routeToSave.createdAt } : null);
+      }
     } catch (error) {
-      Toast.show({
-        type: 'error',
-        text1: 'Error',
-        text2: 'Failed to save route',
-      });
+      console.error("Error in handleSaveRoute:", error);
+      Toast.show({ type: 'error', text1: 'Error', text2: 'Failed to save route' });
     }
   };
 
   const toggleTag = (tag: string) => {
-    setSelectedTags(prev => 
-      prev.includes(tag) 
+    setSelectedTags(prev =>
+      prev.includes(tag)
         ? prev.filter(t => t !== tag)
         : [...prev, tag]
     );
   };
 
-  useEffect(() => {
-    loadSavedRoutes();
-    return () => {
-      if (watcher) {
-        watcher.remove();
+  const handleToggleFollowing = async () => {
+    if (!locationWatcher) {
+      const { status } = await Location.requestForegroundPermissionsAsync();
+      if (status !== 'granted') {
+        Toast.show({ type: 'error', text1: 'Location Permission Denied' });
+        return;
       }
-    };
-  }, []);
-
-  const loadSavedRoutes = async () => {
-    try {
-      const routes = await getSavedRoutes();
-      setSavedRoutes(routes);
-    } catch (error) {
-      Toast.show({
-        type: 'error',
-        text1: 'Error',
-        text2: 'Failed to load saved routes',
-      });
+      const subscription = await Location.watchPositionAsync(
+        { accuracy: Location.Accuracy.High, timeInterval: 2000, distanceInterval: 10 },
+        (location) => {
+          const coords = { latitude: location.coords.latitude, longitude: location.coords.longitude };
+          setUserLocation(coords);
+          mapRef.current?.animateToRegion({
+            ...coords,
+            latitudeDelta: 0.01,
+            longitudeDelta: 0.01,
+          }, 1000);
+        }
+      );
+      setLocationWatcher(subscription);
+      Toast.show({ type: 'info', text1: 'Following Your Location' });
+    } else {
+      locationWatcher.remove();
+      setLocationWatcher(null);
+      Toast.show({ type: 'info', text1: 'Stopped Following' });
     }
   };
 
+  const handleStartTurnByTurn = () => {
+    if (!routeData) {
+      Toast.show({ type: 'error', text1: 'Route data not loaded' });
+      return;
+    }
+    if (!routeData.steps || routeData.steps.length === 0) {
+      Alert.alert(
+          "Navigation Not Available",
+          "Detailed turn-by-turn steps are not available for this route. Cannot start navigation."
+      );
+      return;
+    }
+
+    router.push({
+      pathname: '/RideTrackingScreen',
+      params: { routeToNavigate: JSON.stringify(routeData) },
+    });
+  };
+
   if (!routeData) {
-    return (
-      <View style={styles.container}>
-        <TouchableOpacity style={styles.backButton} onPress={handleBack}>
-          <ArrowLeft color="#2563eb" size={24} />
-        </TouchableOpacity>
-        <Text style={styles.errorText}>Route not found</Text>
-      </View>
-    );
+    return <Text style={styles.loadingText}>Loading route details...</Text>;
   }
 
+  const initialMapRegion = routeData.bounds
+    ? {
+        latitude: (routeData.bounds.northeast.latitude + routeData.bounds.southwest.latitude) / 2,
+        longitude: (routeData.bounds.northeast.longitude + routeData.bounds.southwest.longitude) / 2,
+        latitudeDelta: Math.abs(routeData.bounds.northeast.latitude - routeData.bounds.southwest.latitude) * 1.5,
+        longitudeDelta: Math.abs(routeData.bounds.northeast.longitude - routeData.bounds.southwest.longitude) * 1.5,
+      }
+    : {
+        latitude: routeData.startLocation.latitude,
+        longitude: routeData.startLocation.longitude,
+        latitudeDelta: 0.05,
+        longitudeDelta: 0.05,
+      };
+
   return (
-    <View style={styles.container}>
-      <TouchableOpacity style={styles.backButton} onPress={handleBack}>
-        <ArrowLeft color="#2563eb" size={24} />
-      </TouchableOpacity>
+    <ScrollView style={styles.container}>
+      <View style={styles.header}>
+        <TouchableOpacity onPress={handleBack} style={styles.backButton}>
+          <ArrowLeft size={24} color="#000" />
+        </TouchableOpacity>
+        <Text style={styles.headerTitle} numberOfLines={1}>{routeData.name || 'Route Details'}</Text>
+        <TouchableOpacity onPress={handleLike} style={styles.iconButton}>
+          <Heart size={24} color={liked ? '#ef4444' : '#000'} fill={liked ? '#ef4444' : 'none'} />
+        </TouchableOpacity>
+      </View>
 
-      <TouchableOpacity
-        style={[styles.navigationButton, watcher && styles.navigationButtonActive]}
-        onPress={async () => {
-          if (!watcher) {
-            const { status } = await Location.requestForegroundPermissionsAsync();
-            if (status !== 'granted') {
-              Toast.show({ 
-                type: 'error', 
-                text1: 'Location permission denied',
-                text2: 'Please enable location access in your device settings'
-              });
-              return;
+      <View style={styles.mapContainer}>
+        <MapView
+          ref={mapRef}
+          provider={PROVIDER_GOOGLE}
+          style={styles.map}
+          showsUserLocation
+          showsMyLocationButton={false}
+          scrollEnabled={!locationWatcher}
+          zoomEnabled={!locationWatcher}
+          pitchEnabled={!locationWatcher}
+          rotateEnabled={!locationWatcher}
+          initialRegion={initialMapRegion}
+          onMapReady={() => {
+            if (routeData.bounds) {
+              mapRef.current?.fitToCoordinates([
+                { latitude: routeData.bounds.northeast.latitude, longitude: routeData.bounds.northeast.longitude },
+                { latitude: routeData.bounds.southwest.latitude, longitude: routeData.bounds.southwest.longitude },
+              ], { edgePadding: { top: 40, right: 40, bottom: 40, left: 40 }, animated: true });
             }
-
-            const subscription = await Location.watchPositionAsync(
-              { 
-                accuracy: Location.Accuracy.High, 
-                timeInterval: 2000, 
-                distanceInterval: 10 
-              },
-              (location) => {
-                const coords = {
-                  latitude: location.coords.latitude,
-                  longitude: location.coords.longitude,
-                };
-                setUserLocation(coords);
-                mapRef.current?.animateToRegion({
-                  ...coords,
-                  latitudeDelta: 0.01,
-                  longitudeDelta: 0.01,
-                }, 1000);
-              }
-            );
-
-            setWatcher(subscription);
-            Toast.show({ 
-              type: 'success', 
-              text1: 'Navigation started',
-              text2: 'Following your location'
-            });
-          } else {
-            watcher.remove();
-            setWatcher(null);
-            Toast.show({ 
-              type: 'info', 
-              text1: 'Navigation stopped',
-              text2: 'Map controls restored'
-            });
-          }
-        }}
-      >
-        <Navigation color="#ffffff" size={20} style={styles.navigationIcon} />
-        <Text style={styles.navigationButtonText}>
-          {watcher ? 'Stop Navigation' : 'Start Navigation'}
-        </Text>
-      </TouchableOpacity>
-      
-      <MapView
-        ref={mapRef}
-        provider={PROVIDER_GOOGLE}
-        style={styles.map}
-        showsUserLocation
-        followsUserLocation={watcher !== null}
-        showsMyLocationButton
-        scrollEnabled={!watcher}
-        zoomEnabled={!watcher}
-        initialRegion={{
-          latitude: routeData.startLocation.latitude,
-          longitude: routeData.startLocation.longitude,
-          latitudeDelta: 0.05,
-          longitudeDelta: 0.05,
-        }}
-      >
-        <Polyline
-          coordinates={routeData.coordinates.map(coord => ({
-            latitude: coord[0],
-            longitude: coord[1],
-          }))}
-          strokeColor="#1E90FF"
-          strokeWidth={4}
-        />
-        <Marker coordinate={routeData.startLocation} />
-        <Marker coordinate={routeData.endLocation} />
-        {userLocation && (
-          <Marker
-            coordinate={userLocation}
-            title="You"
-            pinColor="blue"
+          }}
+        >
+          <Polyline
+            coordinates={routeData.coordinates.map(coord => ({ latitude: coord[0], longitude: coord[1] }))}
+            strokeColor="#1E90FF"
+            strokeWidth={4}
           />
-        )}
-      </MapView>
+          <Marker coordinate={routeData.startLocation} title="Start" pinColor="green"/>
+          <Marker coordinate={routeData.endLocation} title="End" pinColor="red"/>
+          {userLocation && locationWatcher && (
+            <Marker coordinate={userLocation} title="You" pinColor="blue" />
+          )}
+        </MapView>
 
-      <ScrollView style={styles.infoContainer}>
-        <View style={styles.routeInfo}>
-          <Text style={styles.routeName}>{routeData.name}</Text>
-          <Text style={styles.routeDistance}>{routeData.distance.toFixed(1)} km</Text>
-        </View>
+        <TouchableOpacity
+          style={[styles.mapButton, styles.followButton]}
+          onPress={handleToggleFollowing}
+        >
+          <MapPin color="#ffffff" size={20}/>
+          <Text style={styles.mapButtonText}>{locationWatcher ? 'Stop Following' : 'Follow Me'}</Text>
+        </TouchableOpacity>
+
+         <TouchableOpacity
+          style={[styles.mapButton, styles.startButton]}
+          onPress={handleStartTurnByTurn}
+          disabled={!routeData.steps || routeData.steps.length === 0}
+        >
+          <PlayCircle color="#ffffff" size={20}/>
+          <Text style={styles.mapButtonText}>Start Navigation</Text>
+        </TouchableOpacity>
+      </View>
+
+      <View style={styles.detailsContainer}>
+        <Text style={styles.distanceText}>
+            {routeData.distance.toFixed(1)} km
+            {routeData.duration && `  ·  ${Math.round(routeData.duration / 60)} min`}
+        </Text>
 
         <View style={styles.ratingContainer}>
-          <Star color="#2563eb" size={20} />
+          <Text style={styles.label}>Rate this Route (1-5):</Text>
           <TextInput
             style={styles.ratingInput}
-            placeholder="Rate (1-5)"
+            keyboardType="numeric"
             value={rating}
             onChangeText={setRating}
-            keyboardType="numeric"
+            maxLength={1}
+            placeholder="-"
+            placeholderTextColor="#9ca3af"
           />
         </View>
 
         <View style={styles.tagsContainer}>
-          <Tag color="#2563eb" size={20} />
-          <Text style={styles.tagsLabel}>Tags:</Text>
-          <View style={styles.tagsList}>
+          <Text style={styles.label}>Tags:</Text>
+          <View style={styles.tagSelection}>
             {AVAILABLE_TAGS.map(tag => (
               <TouchableOpacity
                 key={tag}
-                style={[
-                  styles.tag,
-                  selectedTags.includes(tag) && styles.tagSelected
-                ]}
+                style={[styles.tag, selectedTags.includes(tag) && styles.tagSelected]}
                 onPress={() => toggleTag(tag)}
               >
-                <Text style={[
-                  styles.tagText,
-                  selectedTags.includes(tag) && styles.tagTextSelected
-                ]}>
+                <Tag size={16} color={selectedTags.includes(tag) ? '#ffffff' : '#64748b'} style={styles.tagIcon}/>
+                <Text style={[styles.tagText, selectedTags.includes(tag) && styles.tagTextSelected]}>
                   {tag}
                 </Text>
               </TouchableOpacity>
@@ -284,177 +312,168 @@ export default function RouteDetailsScreen() {
           </View>
         </View>
 
-        <View style={styles.actionButtons}>
-          <TouchableOpacity 
-            style={[styles.button, liked && styles.buttonLiked]} 
-            onPress={handleLike}
-          >
-            <Heart color={liked ? "#ef4444" : "#2563eb"} size={24} />
-            <Text style={[styles.buttonText, liked && styles.buttonTextLiked]}>
-              {liked ? 'Unlike Route' : 'Rate this Route'}
-            </Text>
-          </TouchableOpacity>
-
-          <TouchableOpacity 
-            style={styles.button} 
-            onPress={handleSaveRoute}
-          >
-            <Bookmark color="#2563eb" size={24} />
-            <Text style={styles.buttonText}>Save Route</Text>
-          </TouchableOpacity>
-        </View>
-      </ScrollView>
-    </View>
+        <TouchableOpacity style={styles.saveButton} onPress={handleSaveRoute}>
+          <Bookmark size={20} color="#ffffff" style={styles.saveIcon}/>
+          <Text style={styles.saveButtonText}>Save Route</Text>
+        </TouchableOpacity>
+      </View>
+    </ScrollView>
   );
 }
 
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: '#fff',
+    backgroundColor: '#f8fafc',
   },
-  map: {
-    flex: 1,
+  loadingText: {
+      flex: 1,
+      textAlign: 'center',
+      marginTop: 50,
+      fontSize: 18,
+      color: '#64748b'
+  },
+  header: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 16,
+    paddingTop: 50,
+    paddingBottom: 12,
+    backgroundColor: '#ffffff',
+    borderBottomWidth: 1,
+    borderBottomColor: '#e5e5e5',
   },
   backButton: {
-    position: 'absolute',
-    top: 16,
-    left: 16,
-    zIndex: 1,
-    backgroundColor: 'white',
     padding: 8,
-    borderRadius: 8,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.1,
-    shadowRadius: 4,
-    elevation: 3,
   },
-  navigationButton: {
+  headerTitle: {
+    fontSize: 18,
+    fontWeight: '600',
+    textAlign: 'center',
+    flex: 1,
+    marginHorizontal: 8,
+  },
+  iconButton: {
+    padding: 8,
+  },
+  mapContainer: {
+      position: 'relative',
+      height: 350,
+      width: '100%',
+  },
+  map: {
+    ...StyleSheet.absoluteFillObject,
+  },
+  mapButton: {
     position: 'absolute',
-    top: 16,
-    right: 16,
-    zIndex: 1,
-    backgroundColor: '#2563eb',
-    padding: 12,
-    borderRadius: 8,
+    zIndex: 10,
+    backgroundColor: 'rgba(0, 0, 0, 0.6)',
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    borderRadius: 20,
     flexDirection: 'row',
     alignItems: 'center',
     shadowColor: '#000',
     shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.1,
+    shadowOpacity: 0.3,
     shadowRadius: 4,
-    elevation: 3,
+    elevation: 5,
   },
-  navigationButtonActive: {
-    backgroundColor: '#ef4444',
+  followButton: {
+    bottom: 20,
+    left: 20,
   },
-  navigationIcon: {
-    marginRight: 8,
+  startButton: {
+    bottom: 20,
+    right: 20,
+    backgroundColor: '#2563eb',
   },
-  navigationButtonText: {
-    color: '#ffffff',
-    fontSize: 16,
-    fontWeight: '600',
+  mapButtonText: {
+      marginLeft: 6,
+      color: '#ffffff',
+      fontSize: 14,
+      fontWeight: '600',
   },
-  infoContainer: {
-    flex: 1,
-    backgroundColor: '#fff',
-    borderTopWidth: 1,
-    borderTopColor: '#e2e8f0',
+  detailsContainer: {
+    padding: 20,
+    backgroundColor: '#ffffff',
+    marginTop: -10,
+    borderTopLeftRadius: 10,
+    borderTopRightRadius: 10,
   },
-  routeInfo: {
-    padding: 16,
-  },
-  routeName: {
-    fontSize: 24,
-    fontWeight: '600',
-    color: '#1e293b',
-    marginBottom: 4,
-  },
-  routeDistance: {
-    fontSize: 16,
-    color: '#64748b',
+  distanceText: {
+    fontSize: 18,
+    fontWeight: '500',
+    marginBottom: 25,
+    textAlign: 'center',
+    color: '#374151',
   },
   ratingContainer: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    padding: 16,
-    paddingTop: 0,
-    gap: 8,
+    marginBottom: 20,
+  },
+  label: {
+    fontSize: 16,
+    fontWeight: '500',
+    marginBottom: 8,
+    color: '#1f2937',
   },
   ratingInput: {
-    flex: 1,
     borderWidth: 1,
-    borderColor: '#e2e8f0',
+    borderColor: '#d1d5db',
     borderRadius: 8,
-    padding: 8,
+    padding: 12,
     fontSize: 16,
+    textAlign: 'center',
   },
   tagsContainer: {
-    padding: 16,
-    paddingTop: 0,
+    marginBottom: 25,
   },
-  tagsLabel: {
-    fontSize: 16,
-    color: '#64748b',
-    marginBottom: 8,
-  },
-  tagsList: {
+  tagSelection: {
     flexDirection: 'row',
     flexWrap: 'wrap',
-    gap: 8,
+    gap: 10,
   },
   tag: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#f3f4f6',
+    paddingVertical: 8,
     paddingHorizontal: 12,
-    paddingVertical: 6,
     borderRadius: 16,
-    backgroundColor: '#f1f5f9',
     borderWidth: 1,
-    borderColor: '#e2e8f0',
+    borderColor: '#e5e7eb',
   },
   tagSelected: {
-    backgroundColor: '#eff6ff',
+    backgroundColor: '#2563eb',
     borderColor: '#2563eb',
   },
+  tagIcon: {
+    marginRight: 6,
+  },
   tagText: {
-    color: '#64748b',
     fontSize: 14,
+    color: '#4b5563',
   },
   tagTextSelected: {
-    color: '#2563eb',
+    color: '#ffffff',
   },
-  actionButtons: {
-    flexDirection: 'row',
-    gap: 12,
+  saveButton: {
+    backgroundColor: '#10b981',
     padding: 16,
-    paddingTop: 0,
-  },
-  button: {
-    flex: 1,
+    borderRadius: 12,
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
     gap: 8,
-    padding: 12,
-    backgroundColor: '#eff6ff',
-    borderRadius: 8,
+    marginTop: 10,
   },
-  buttonLiked: {
-    backgroundColor: '#fef2f2',
+  saveIcon: {
+    marginRight: 8,
   },
-  buttonText: {
+  saveButtonText: {
+    color: '#ffffff',
     fontSize: 16,
-    fontWeight: '500',
-    color: '#2563eb',
-  },
-  buttonTextLiked: {
-    color: '#ef4444',
-  },
-  errorText: {
-    fontSize: 16,
-    color: '#ef4444',
-    textAlign: 'center',
-    marginTop: 20,
+    fontWeight: '600',
   },
 }); 
