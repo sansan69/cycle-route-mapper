@@ -1,8 +1,8 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { View, StyleSheet, TouchableOpacity, Text, TextInput, Alert, Button } from 'react-native';
+import { View, StyleSheet, TouchableOpacity, Text, TextInput, ScrollView } from 'react-native';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import MapView, { Polyline, Marker, PROVIDER_GOOGLE } from 'react-native-maps';
-import { Heart, ArrowLeft, Star, Tag, Bookmark, Navigation, StopCircle } from 'lucide-react-native';
+import { Heart, ArrowLeft, Star, Tag, Bookmark, Navigation } from 'lucide-react-native';
 import Toast from 'react-native-toast-message';
 import { saveRoute, getSavedRoutes } from '@/utils/storage';
 import { v4 as uuidv4 } from 'uuid';
@@ -150,6 +150,63 @@ export default function RouteDetailsScreen() {
       <TouchableOpacity style={styles.backButton} onPress={handleBack}>
         <ArrowLeft color="#2563eb" size={24} />
       </TouchableOpacity>
+
+      <TouchableOpacity
+        style={[styles.navigationButton, watcher && styles.navigationButtonActive]}
+        onPress={async () => {
+          if (!watcher) {
+            const { status } = await Location.requestForegroundPermissionsAsync();
+            if (status !== 'granted') {
+              Toast.show({ 
+                type: 'error', 
+                text1: 'Location permission denied',
+                text2: 'Please enable location access in your device settings'
+              });
+              return;
+            }
+
+            const subscription = await Location.watchPositionAsync(
+              { 
+                accuracy: Location.Accuracy.High, 
+                timeInterval: 2000, 
+                distanceInterval: 10 
+              },
+              (location) => {
+                const coords = {
+                  latitude: location.coords.latitude,
+                  longitude: location.coords.longitude,
+                };
+                setUserLocation(coords);
+                mapRef.current?.animateToRegion({
+                  ...coords,
+                  latitudeDelta: 0.01,
+                  longitudeDelta: 0.01,
+                }, 1000);
+              }
+            );
+
+            setWatcher(subscription);
+            Toast.show({ 
+              type: 'success', 
+              text1: 'Navigation started',
+              text2: 'Following your location'
+            });
+          } else {
+            watcher.remove();
+            setWatcher(null);
+            Toast.show({ 
+              type: 'info', 
+              text1: 'Navigation stopped',
+              text2: 'Map controls restored'
+            });
+          }
+        }}
+      >
+        <Navigation color="#ffffff" size={20} style={styles.navigationIcon} />
+        <Text style={styles.navigationButtonText}>
+          {watcher ? 'Stop Navigation' : 'Start Navigation'}
+        </Text>
+      </TouchableOpacity>
       
       <MapView
         ref={mapRef}
@@ -186,7 +243,7 @@ export default function RouteDetailsScreen() {
         )}
       </MapView>
 
-      <View style={styles.infoContainer}>
+      <ScrollView style={styles.infoContainer}>
         <View style={styles.routeInfo}>
           <Text style={styles.routeName}>{routeData.name}</Text>
           <Text style={styles.routeDistance}>{routeData.distance.toFixed(1)} km</Text>
@@ -234,73 +291,19 @@ export default function RouteDetailsScreen() {
           >
             <Heart color={liked ? "#ef4444" : "#2563eb"} size={24} />
             <Text style={[styles.buttonText, liked && styles.buttonTextLiked]}>
-              {liked ? 'Unlike Route' : 'Like Route'}
+              {liked ? 'Unlike Route' : 'Rate this Route'}
             </Text>
           </TouchableOpacity>
 
-          <Button 
-            title="Save Route" 
+          <TouchableOpacity 
+            style={styles.button} 
             onPress={handleSaveRoute}
-            color="#2563eb"
-          />
+          >
+            <Bookmark color="#2563eb" size={24} />
+            <Text style={styles.buttonText}>Save Route</Text>
+          </TouchableOpacity>
         </View>
-
-        <TouchableOpacity
-          style={[styles.navigationButton, watcher && styles.navigationButtonActive]}
-          onPress={async () => {
-            if (!watcher) {
-              const { status } = await Location.requestForegroundPermissionsAsync();
-              if (status !== 'granted') {
-                Toast.show({ 
-                  type: 'error', 
-                  text1: 'Location permission denied',
-                  text2: 'Please enable location access in your device settings'
-                });
-                return;
-              }
-
-              const subscription = await Location.watchPositionAsync(
-                { 
-                  accuracy: Location.Accuracy.High, 
-                  timeInterval: 2000, 
-                  distanceInterval: 10 
-                },
-                (location) => {
-                  const coords = {
-                    latitude: location.coords.latitude,
-                    longitude: location.coords.longitude,
-                  };
-                  setUserLocation(coords);
-                  mapRef.current?.animateToRegion({
-                    ...coords,
-                    latitudeDelta: 0.01,
-                    longitudeDelta: 0.01,
-                  }, 1000);
-                }
-              );
-
-              setWatcher(subscription);
-              Toast.show({ 
-                type: 'success', 
-                text1: 'Navigation started',
-                text2: 'Following your location'
-              });
-            } else {
-              watcher.remove();
-              setWatcher(null);
-              Toast.show({ 
-                type: 'info', 
-                text1: 'Navigation stopped',
-                text2: 'Map controls restored'
-              });
-            }
-          }}
-        >
-          <Text style={styles.navigationButtonText}>
-            {watcher ? 'Stop Navigation' : 'Start Navigation'}
-          </Text>
-        </TouchableOpacity>
-      </View>
+      </ScrollView>
     </View>
   );
 }
@@ -327,14 +330,41 @@ const styles = StyleSheet.create({
     shadowRadius: 4,
     elevation: 3,
   },
+  navigationButton: {
+    position: 'absolute',
+    top: 16,
+    right: 16,
+    zIndex: 1,
+    backgroundColor: '#2563eb',
+    padding: 12,
+    borderRadius: 8,
+    flexDirection: 'row',
+    alignItems: 'center',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.1,
+    shadowRadius: 4,
+    elevation: 3,
+  },
+  navigationButtonActive: {
+    backgroundColor: '#ef4444',
+  },
+  navigationIcon: {
+    marginRight: 8,
+  },
+  navigationButtonText: {
+    color: '#ffffff',
+    fontSize: 16,
+    fontWeight: '600',
+  },
   infoContainer: {
-    padding: 16,
+    flex: 1,
     backgroundColor: '#fff',
     borderTopWidth: 1,
     borderTopColor: '#e2e8f0',
   },
   routeInfo: {
-    marginBottom: 16,
+    padding: 16,
   },
   routeName: {
     fontSize: 24,
@@ -349,7 +379,8 @@ const styles = StyleSheet.create({
   ratingContainer: {
     flexDirection: 'row',
     alignItems: 'center',
-    marginBottom: 16,
+    padding: 16,
+    paddingTop: 0,
     gap: 8,
   },
   ratingInput: {
@@ -361,7 +392,8 @@ const styles = StyleSheet.create({
     fontSize: 16,
   },
   tagsContainer: {
-    marginBottom: 16,
+    padding: 16,
+    paddingTop: 0,
   },
   tagsLabel: {
     fontSize: 16,
@@ -395,6 +427,8 @@ const styles = StyleSheet.create({
   actionButtons: {
     flexDirection: 'row',
     gap: 12,
+    padding: 16,
+    paddingTop: 0,
   },
   button: {
     flex: 1,
@@ -422,25 +456,5 @@ const styles = StyleSheet.create({
     color: '#ef4444',
     textAlign: 'center',
     marginTop: 20,
-  },
-  navigationButton: {
-    backgroundColor: '#2563eb',
-    padding: 16,
-    borderRadius: 12,
-    alignItems: 'center',
-    marginTop: 16,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.1,
-    shadowRadius: 4,
-    elevation: 3,
-  },
-  navigationButtonActive: {
-    backgroundColor: '#ef4444',
-  },
-  navigationButtonText: {
-    color: '#ffffff',
-    fontSize: 16,
-    fontWeight: '600',
   },
 }); 
